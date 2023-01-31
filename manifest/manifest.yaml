@@ -1,0 +1,120 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hnc-extension-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: list-apis
+rules:
+- apiGroups:
+  - "*"
+  resources:
+  - "*"
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hns-list-apis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: list-apis
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: hnc-extension-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: hns-list
+  name: hns-list
+  namespace: hnc-extension-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hns-list
+  template:
+    metadata:
+      labels:
+        app: hns-list
+    spec:
+      containers:
+      - image: hns-list:latest
+        name: hns-list
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+        - name: certs
+          mountPath: /certs
+        env:
+        - name: CERTPATH
+          value: /certs/tls.crt
+        - name: KEYPATH
+          value: /certs/tls.key
+      volumes:
+      - secret:
+          defaultMode: 420
+          secretName: hns-server-cert
+        name: certs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: hns-list
+  name: hns-list
+  namespace: hnc-extension-system
+spec:
+  ports:
+  - port: 7443
+    protocol: TCP
+    targetPort: 7443
+  selector:
+    app: hns-list
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: ca-issuer
+  namespace: hnc-extension-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hns-list-cert
+  namespace: hnc-extension-system
+spec:
+  dnsNames:
+  - hns-list.hnc-extension-system.svc
+  - hns-list.hnc-extension-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: ca-issuer
+  secretName: hns-server-cert
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.resources.hns.demo
+  annotations:
+    cert-manager.io/inject-ca-from: hnc-extension-system/hns-list-cert
+spec:
+  group: resources.hns.demo
+  version: v1alpha1
+  groupPriorityMinimum: 10
+  versionPriority: 10
+  service:
+    namespace: hnc-extension-system
+    name: hns-list
+    port: 7443
