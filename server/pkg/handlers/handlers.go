@@ -70,17 +70,52 @@ func Forwarder(dynamicClient dynamic.Interface, apis apiresources.APIResourceWat
 		resourceClient := dynamicClient.Resource(resource)
 		opts := metav1.ListOptions{}
 		paramCodec.DecodeParameters(r.URL.Query(), metav1.SchemeGroupVersion, &opts)
-		resources, err := resourceClient.List(r.Context(), opts)
-		if apierrors.IsNotFound(err) {
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
+		if opts.Watch {
+			watch(w, r, resourceClient, opts)
+		} else {
+			list(w, r, resourceClient, opts)
 		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		returnResp(w, resources.UnstructuredContent())
 	}
+}
+
+func watch(w http.ResponseWriter, r *http.Request, client dynamic.ResourceInterface, opts metav1.ListOptions) {
+	clientGone := w.(http.CloseNotifier).CloseNotify()
+	watcher, err := client.Watch(r.Context(), opts)
+
+	if apierrors.IsNotFound(err) {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	for {
+		w.(http.Flusher).Flush()
+		select {
+		case event := <-watcher.ResultChan():
+			returnResp(w, event)
+		case <-clientGone:
+			logrus.Infof("client disconnected: %v", r.RemoteAddr)
+			return
+		}
+	}
+}
+
+func list(w http.ResponseWriter, r *http.Request, client dynamic.ResourceInterface, opts metav1.ListOptions) {
+	resources, err := client.List(r.Context(), opts)
+	if apierrors.IsNotFound(err) {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	returnResp(w, resources.UnstructuredContent())
 }
 
 func NamespaceHandler(apis apiresources.APIResourceWatcher, namespaceCache corecontrollers.NamespaceCache, dynamicClient dynamic.Interface) http.HandlerFunc {
@@ -216,7 +251,7 @@ func gvrFromVars(vars map[string]string, apis apiresources.APIResourceWatcher) (
 	return schema.GroupVersionResource{Group: group, Version: resource.Version, Resource: resourceName}, nil
 }
 
-func returnResp(w http.ResponseWriter, resp map[string]interface{}) {
+func returnResp(w http.ResponseWriter, resp interface{}) {
 	resourceJSON, err := json.Marshal(resp)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -224,6 +259,7 @@ func returnResp(w http.ResponseWriter, resp map[string]interface{}) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(resourceJSON)
+	w.Write([]byte("\n"))
 	return
 }
 

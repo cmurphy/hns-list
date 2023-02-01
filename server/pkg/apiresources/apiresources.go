@@ -133,7 +133,7 @@ func (a *apiResourceWatcher) setAPIResources() error {
 				Group:              group,
 				Version:            version,
 				Kind:               r.Kind,
-				Verbs:              []string{"list"},
+				Verbs:              []string{"list", "watch"},
 				Namespaced:         true,
 				StorageVersionHash: apidiscovery.StorageVersionHash(group, version, r.Kind),
 			}
