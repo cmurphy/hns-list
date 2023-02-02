@@ -96,9 +96,16 @@ func watch(w http.ResponseWriter, r *http.Request, client dynamic.ResourceInterf
 		w.(http.Flusher).Flush()
 		select {
 		case event := <-watcher.ResultChan():
-			returnResp(w, event)
+			internalEvent := metav1.InternalEvent(event)
+			outEvent := &metav1.WatchEvent{}
+			err := metav1.Convert_v1_InternalEvent_To_v1_WatchEvent(&internalEvent, outEvent, nil)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			returnResp(w, outEvent)
 		case <-clientGone:
-			logrus.Infof("client disconnected: %v", r.RemoteAddr)
+			logrus.Debugf("client disconnected: %v", r.RemoteAddr)
 			return
 		}
 	}
