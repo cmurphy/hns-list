@@ -49,7 +49,7 @@ spec:
         app: hns-list
     spec:
       containers:
-      - image: hns-list:latest
+      - image: cmurpheus/hns-list:latest
         name: hns-list
         imagePullPolicy: IfNotPresent
         volumeMounts:
