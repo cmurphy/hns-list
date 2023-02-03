@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"golang.org/x/sync/semaphore"
@@ -70,59 +71,26 @@ func Forwarder(dynamicClient dynamic.Interface, apis apiresources.APIResourceWat
 		resourceClient := dynamicClient.Resource(resource)
 		opts := metav1.ListOptions{}
 		paramCodec.DecodeParameters(r.URL.Query(), metav1.SchemeGroupVersion, &opts)
+
 		if opts.Watch {
-			watch(w, r, resourceClient, opts)
-		} else {
-			list(w, r, resourceClient, opts)
-		}
-	}
-}
-
-func watch(w http.ResponseWriter, r *http.Request, client dynamic.ResourceInterface, opts metav1.ListOptions) {
-	clientGone := w.(http.CloseNotifier).CloseNotify()
-	watcher, err := client.Watch(r.Context(), opts)
-
-	if apierrors.IsNotFound(err) {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	for {
-		w.(http.Flusher).Flush()
-		select {
-		case event := <-watcher.ResultChan():
-			internalEvent := metav1.InternalEvent(event)
-			outEvent := &metav1.WatchEvent{}
-			err := metav1.Convert_v1_InternalEvent_To_v1_WatchEvent(&internalEvent, outEvent, nil)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
+			callback := func(event *metav1.WatchEvent) {
+				returnResp(w, event)
+				w.(http.Flusher).Flush()
 			}
-			returnResp(w, outEvent)
-		case <-clientGone:
-			logrus.Debugf("client disconnected: %v", r.RemoteAddr)
+			err = watch(r.Context(), w, r, resourceClient, opts, callback)
+		} else {
+			err = list(w, r, resourceClient, opts)
+		}
+
+		if apierrors.IsNotFound(err) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
-}
-
-func list(w http.ResponseWriter, r *http.Request, client dynamic.ResourceInterface, opts metav1.ListOptions) {
-	resources, err := client.List(r.Context(), opts)
-	if apierrors.IsNotFound(err) {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	returnResp(w, resources.UnstructuredContent())
 }
 
 func NamespaceHandler(apis apiresources.APIResourceWatcher, namespaceCache corecontrollers.NamespaceCache, dynamicClient dynamic.Interface) http.HandlerFunc {
@@ -177,6 +145,17 @@ func NamespaceHandler(apis apiresources.APIResourceWatcher, namespaceCache corec
 			doneVersions <- true
 		}()
 
+		events := make(chan metav1.WatchEvent)
+		doneEvents := make(chan bool)
+
+		go func() {
+			for event := range events {
+				returnResp(w, event)
+				w.(http.Flusher).Flush()
+			}
+			doneEvents <- true
+		}()
+
 		sem := semaphore.NewWeighted(workers)
 		for _, ns := range namespaces {
 			ns := ns.Name
@@ -186,24 +165,33 @@ func NamespaceHandler(apis apiresources.APIResourceWatcher, namespaceCache corec
 			}
 			eg.Go(func() error {
 				defer sem.Release(1)
-				resourcesForNamespace, err := resourceClient.Namespace(ns).List(ctx, opts)
-				if err != nil {
-					return err
-				}
-				if resourcesForNamespace != nil && len(resourcesForNamespace.Items) > 0 {
-					rv, err := strconv.Atoi(resourcesForNamespace.GetResourceVersion())
+				if opts.Watch {
+					callback := func(event *metav1.WatchEvent) { events <- *event }
+					err = watch(ctx, w, r, resourceClient.Namespace(ns), opts, callback)
+				} else {
+					resourcesForNamespace, err := resourceClient.Namespace(ns).List(ctx, opts)
 					if err != nil {
-						rv = 0
+						return err
 					}
-					resourceVersions <- rv
-					for _, r := range resourcesForNamespace.Items {
-						results <- r
+					if resourcesForNamespace != nil && len(resourcesForNamespace.Items) > 0 {
+						rv, err := strconv.Atoi(resourcesForNamespace.GetResourceVersion())
+						if err != nil {
+							rv = 0
+						}
+						resourceVersions <- rv
+						for _, r := range resourcesForNamespace.Items {
+							results <- r
+						}
 					}
 				}
 				return nil
 			})
 		}
 		err = eg.Wait()
+		if apierrors.IsNotFound(err) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -211,37 +199,82 @@ func NamespaceHandler(apis apiresources.APIResourceWatcher, namespaceCache corec
 
 		close(results)
 		close(resourceVersions)
+		close(events)
 		<-doneResources
 		<-doneVersions
+		<-doneEvents
 
-		var sortErr error
-		sort.Slice(resourceCollection, func(i, j int) bool {
-			metaI, ok := resourceCollection[i].Object["metadata"].(map[string]interface{})
-			if !ok {
-				sortErr = fmt.Errorf("could not sort invalid resource")
-				return false
-			}
-			metaJ, ok := resourceCollection[j].Object["metadata"].(map[string]interface{})
-			if !ok {
-				sortErr = fmt.Errorf("could not sort invalid resource")
-				return false
-			}
-			if metaI["namespace"].(string) < metaJ["namespace"].(string) {
-				return true
-			}
-			if metaI["namespace"].(string) > metaJ["namespace"].(string) {
-				return false
-			}
-			return metaI["name"].(string) < metaJ["name"].(string)
-		})
-		if sortErr != nil {
-			http.Error(w, sortErr.Error(), http.StatusInternalServerError)
+		if opts.Watch {
+			return
+		}
+
+		err = sortCollection(resourceCollection)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		resp := responseData(resource, apis.GetKindForResource(resource)+"List", strconv.Itoa(latestResourceVersion), resourceCollection)
 		returnResp(w, resp)
 	}
+}
+
+func watch(ctx context.Context, w http.ResponseWriter, r *http.Request, client dynamic.ResourceInterface, opts metav1.ListOptions, callback func(event *metav1.WatchEvent)) error {
+	clientGone := w.(http.CloseNotifier).CloseNotify()
+	watcher, err := client.Watch(ctx, opts)
+	if err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case event := <-watcher.ResultChan():
+			internalEvent := metav1.InternalEvent(event)
+			outEvent := &metav1.WatchEvent{}
+			err := metav1.Convert_v1_InternalEvent_To_v1_WatchEvent(&internalEvent, outEvent, nil)
+			if err != nil {
+				return err
+			}
+			callback(outEvent)
+		case <-clientGone:
+			logrus.Debugf("client disconnected: %v", r.RemoteAddr)
+			return nil
+		}
+	}
+}
+
+func list(w http.ResponseWriter, r *http.Request, client dynamic.ResourceInterface, opts metav1.ListOptions) error {
+	resources, err := client.List(r.Context(), opts)
+	if err != nil {
+		return err
+	}
+
+	returnResp(w, resources.UnstructuredContent())
+	return nil
+}
+
+func sortCollection(resourceCollection []unstructured.Unstructured) error {
+	var err error
+	sort.Slice(resourceCollection, func(i, j int) bool {
+		metaI, ok := resourceCollection[i].Object["metadata"].(map[string]interface{})
+		if !ok {
+			err = fmt.Errorf("could not sort invalid resource")
+			return false
+		}
+		metaJ, ok := resourceCollection[j].Object["metadata"].(map[string]interface{})
+		if !ok {
+			err = fmt.Errorf("could not sort invalid resource")
+			return false
+		}
+		if metaI["namespace"].(string) < metaJ["namespace"].(string) {
+			return true
+		}
+		if metaI["namespace"].(string) > metaJ["namespace"].(string) {
+			return false
+		}
+		return metaI["name"].(string) < metaJ["name"].(string)
+	})
+	return err
 }
 
 func gvrFromVars(vars map[string]string, apis apiresources.APIResourceWatcher) (schema.GroupVersionResource, error) {
