@@ -39,6 +39,7 @@ func init() {
 			}
 			return nil
 		},
+		SilenceUsage: true,
 	}
 	rootCmd.PersistentFlags().StringVarP(&namespace, "namespace", "n", "default", "parent namespace to scope request to")
 	rootCmd.PersistentFlags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "list across all namespaces")

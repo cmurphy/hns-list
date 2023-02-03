@@ -65,6 +65,9 @@ func getClient(resource string) dynamic.ResourceInterface {
 
 func (d doer) get(resource string) (string, error) {
 	unst, err := d.client.List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return "", err
+	}
 	rv := unst.GetResourceVersion()
 	if len(unst.Items) == 0 {
 		fmt.Printf("No resources found in %s namespace", namespace)
