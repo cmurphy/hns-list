@@ -47,9 +47,10 @@ type doer struct {
 
 func newDoer(resource string) doer {
 	client := getClient(resource)
+	printOpts := printers.PrintOptions{WithNamespace: true}
 	return doer{
 		client:  client,
-		printer: printers.NewTypeSetter(scheme.Scheme).ToPrinter(printers.NewTablePrinter(printers.PrintOptions{})),
+		printer: printers.NewTypeSetter(scheme.Scheme).ToPrinter(printers.NewTablePrinter(printOpts)),
 	}
 }
 
