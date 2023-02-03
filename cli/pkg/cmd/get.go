@@ -57,10 +57,10 @@ func newDoer(resource string) doer {
 func getClient(resource string) dynamic.ResourceInterface {
 	gvr := GroupVersion.WithResource(resource)
 	resourceClient := client.Resource(gvr)
-	if namespace != "" {
-		return resourceClient.Namespace(namespace)
+	if allNamespaces {
+		return resourceClient
 	}
-	return resourceClient
+	return resourceClient.Namespace(namespace)
 }
 
 func (d doer) get(resource string) (string, error) {
