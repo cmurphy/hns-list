@@ -135,6 +135,7 @@ func (a *apiResourceWatcher) setAPIResources() error {
 				Kind:               r.Kind,
 				Verbs:              []string{"list", "watch"},
 				Namespaced:         true,
+				ShortNames:         r.ShortNames,
 				StorageVersionHash: apidiscovery.StorageVersionHash(group, version, r.Kind),
 			}
 			result = append(result, resource)

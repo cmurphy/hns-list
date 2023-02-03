@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -17,6 +18,7 @@ var (
 	GroupVersion  = schema.GroupVersion{Group: "resources.hns.demo", Version: "v1alpha1"}
 	schemeBuilder = &apischeme.Builder{GroupVersion: GroupVersion}
 	client        *dynamic.DynamicClient
+	mapper        meta.RESTMapper
 )
 
 func init() {
@@ -33,10 +35,16 @@ func init() {
 				return err
 			}
 
+			mapper, err = kubecfgFlags.ToRESTMapper()
+			if err != nil {
+				return err
+			}
+
 			client, err = dynamic.NewForConfig(config)
 			if err != nil {
 				return err
 			}
+
 			return nil
 		},
 		SilenceUsage: true,

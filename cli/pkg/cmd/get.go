@@ -56,6 +56,7 @@ func newDoer(resource string) doer {
 
 func getClient(resource string) dynamic.ResourceInterface {
 	gvr := GroupVersion.WithResource(resource)
+	gvr, _ = mapper.ResourceFor(gvr)
 	resourceClient := client.Resource(gvr)
 	if allNamespaces {
 		return resourceClient
@@ -70,7 +71,7 @@ func (d doer) get(resource string) (string, error) {
 	}
 	rv := unst.GetResourceVersion()
 	if len(unst.Items) == 0 {
-		fmt.Printf("No resources found in %s namespace", namespace)
+		fmt.Printf("No resources found in %s namespace\n", namespace)
 		return rv, nil
 	}
 	unst.SetAPIVersion("resources.hns.demo/v1alpha1")
