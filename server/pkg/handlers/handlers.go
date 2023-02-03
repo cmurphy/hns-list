@@ -16,12 +16,14 @@ import (
 	corecontrollers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 )
 
@@ -73,23 +75,19 @@ func Forwarder(dynamicClient dynamic.Interface, apis apiresources.APIResourceWat
 		paramCodec.DecodeParameters(r.URL.Query(), metav1.SchemeGroupVersion, &opts)
 
 		if opts.Watch {
-			callback := func(event *metav1.WatchEvent) {
-				returnResp(w, event)
-				w.(http.Flusher).Flush()
+			watcher, err := getWatchers(r.Context(), resourceClient, nil, opts)
+			if isErrorAndHandleError(w, err) {
+				return
 			}
-			err = watch(r.Context(), w, r, resourceClient, opts, callback)
-		} else {
-			err = list(w, r, resourceClient, opts)
-		}
-
-		if apierrors.IsNotFound(err) {
-			http.Error(w, err.Error(), http.StatusNotFound)
+			watchHandler(w, r, resourceClient, watcher, opts)
 			return
 		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		resources, err := resourceClient.List(r.Context(), opts)
+		if isErrorAndHandleError(w, err) {
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
+		returnResp(w, resources.UnstructuredContent())
 	}
 }
 
@@ -121,136 +119,173 @@ func NamespaceHandler(apis apiresources.APIResourceWatcher, namespaceCache corec
 			return
 		}
 
-		results := make(chan unstructured.Unstructured)
-		eg, ctx := errgroup.WithContext(r.Context())
-		resourceCollection := make([]unstructured.Unstructured, 0)
-		latestResourceVersion := 0
-		resourceVersions := make(chan int)
-		doneResources := make(chan bool)
-		doneVersions := make(chan bool)
-
-		go func() {
-			for r := range results {
-				resourceCollection = append(resourceCollection, r)
+		if opts.Watch {
+			watchers, err := getWatchers(r.Context(), resourceClient, namespaces, opts)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
 			}
-			doneResources <- true
-		}()
-
-		go func() {
-			for r := range resourceVersions {
-				if r > latestResourceVersion {
-					latestResourceVersion = r
-				}
-			}
-			doneVersions <- true
-		}()
-
-		events := make(chan metav1.WatchEvent)
-		doneEvents := make(chan bool)
-
-		go func() {
-			for event := range events {
-				returnResp(w, event)
-				w.(http.Flusher).Flush()
-			}
-			doneEvents <- true
-		}()
-
-		sem := semaphore.NewWeighted(workers)
-		for _, ns := range namespaces {
-			ns := ns.Name
-			if err := sem.Acquire(ctx, 1); err != nil {
+			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			eg.Go(func() error {
-				defer sem.Release(1)
-				if opts.Watch {
-					callback := func(event *metav1.WatchEvent) { events <- *event }
-					err = watch(ctx, w, r, resourceClient.Namespace(ns), opts, callback)
-				} else {
-					resourcesForNamespace, err := resourceClient.Namespace(ns).List(ctx, opts)
-					if err != nil {
-						return err
-					}
-					if resourcesForNamespace != nil && len(resourcesForNamespace.Items) > 0 {
-						rv, err := strconv.Atoi(resourcesForNamespace.GetResourceVersion())
-						if err != nil {
-							rv = 0
-						}
-						resourceVersions <- rv
-						for _, r := range resourcesForNamespace.Items {
-							results <- r
-						}
-					}
-				}
-				return nil
-			})
-		}
-		err = eg.Wait()
-		if apierrors.IsNotFound(err) {
-			http.Error(w, err.Error(), http.StatusNotFound)
+			watchHandler(w, r, resourceClient, watchers, opts)
 			return
 		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		close(results)
-		close(resourceVersions)
-		close(events)
-		<-doneResources
-		<-doneVersions
-		<-doneEvents
-
-		if opts.Watch {
-			return
-		}
-
-		err = sortCollection(resourceCollection)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		resp := responseData(resource, apis.GetKindForResource(resource)+"List", strconv.Itoa(latestResourceVersion), resourceCollection)
-		returnResp(w, resp)
+		listHandler(w, r, resource, resourceClient, namespaces, opts, apis)
+		return
 	}
 }
 
-func watch(ctx context.Context, w http.ResponseWriter, r *http.Request, client dynamic.ResourceInterface, opts metav1.ListOptions, callback func(event *metav1.WatchEvent)) error {
-	clientGone := w.(http.CloseNotifier).CloseNotify()
-	watcher, err := client.Watch(ctx, opts)
-	if err != nil {
-		return err
+func getWatchers(ctx context.Context, client dynamic.NamespaceableResourceInterface, namespaces []*corev1.Namespace, opts metav1.ListOptions) ([]watch.Interface, error) {
+	if len(namespaces) == 0 {
+		watcher, err := client.Watch(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		return []watch.Interface{watcher}, nil
 	}
-
-	for {
-		select {
-		case event := <-watcher.ResultChan():
-			internalEvent := metav1.InternalEvent(event)
-			outEvent := &metav1.WatchEvent{}
-			err := metav1.Convert_v1_InternalEvent_To_v1_WatchEvent(&internalEvent, outEvent, nil)
+	watcherChan := make(chan watch.Interface)
+	done := make(chan bool)
+	watchers := make([]watch.Interface, 0)
+	go func() {
+		for watcher := range watcherChan {
+			watchers = append(watchers, watcher)
+		}
+		done <- true
+	}()
+	eg := new(errgroup.Group)
+	for _, ns := range namespaces {
+		ns := ns.Name
+		eg.Go(func() error {
+			watcher, err := client.Namespace(ns).Watch(ctx, opts)
 			if err != nil {
 				return err
 			}
-			callback(outEvent)
-		case <-clientGone:
-			logrus.Debugf("client disconnected: %v", r.RemoteAddr)
+			watcherChan <- watcher
 			return nil
-		}
+		})
 	}
+	err := eg.Wait()
+	if err != nil {
+		return nil, err
+	}
+	close(watcherChan)
+	<-done
+	return watchers, nil
 }
 
-func list(w http.ResponseWriter, r *http.Request, client dynamic.ResourceInterface, opts metav1.ListOptions) error {
-	resources, err := client.List(r.Context(), opts)
+func watchHandler(w http.ResponseWriter, r *http.Request, client dynamic.NamespaceableResourceInterface, watchers []watch.Interface, opts metav1.ListOptions) {
+	events := make(chan metav1.WatchEvent)
+	doneEvents := make(chan bool)
+
+	go func() {
+		w.Header().Set("Content-Type", "application/json")
+		for event := range events {
+			returnResp(w, event)
+			w.(http.Flusher).Flush()
+		}
+		doneEvents <- true
+	}()
+
+	eg, ctx := errgroup.WithContext(r.Context())
+	for _, watcher := range watchers {
+		watcher := watcher
+		eg.Go(func() error {
+			for {
+				select {
+				case event := <-watcher.ResultChan():
+					outEvent, err := convertEvent(event)
+					if err != nil {
+						return err
+					}
+					events <- *outEvent
+				case <-ctx.Done():
+					return nil
+				}
+			}
+		})
+	}
+	err := eg.Wait()
 	if err != nil {
-		return err
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+	if ctx.Err() == context.Canceled {
+		logrus.Debugf("client disconnected: %v", r.RemoteAddr)
+	}
+	<-doneEvents
+	return
+}
+
+func listHandler(w http.ResponseWriter, r *http.Request, resource schema.GroupVersionResource, client dynamic.NamespaceableResourceInterface, namespaces []*corev1.Namespace, opts metav1.ListOptions, apis apiresources.APIResourceWatcher) {
+	results := make(chan unstructured.Unstructured)
+	resourceCollection := make([]unstructured.Unstructured, 0)
+	latestResourceVersion := 0
+	resourceVersions := make(chan int)
+	doneResources := make(chan bool)
+	doneVersions := make(chan bool)
+
+	go func() {
+		for r := range results {
+			resourceCollection = append(resourceCollection, r)
+		}
+		doneResources <- true
+	}()
+
+	go func() {
+		for r := range resourceVersions {
+			if r > latestResourceVersion {
+				latestResourceVersion = r
+			}
+		}
+		doneVersions <- true
+	}()
+
+	eg, ctx := errgroup.WithContext(r.Context())
+	sem := semaphore.NewWeighted(workers)
+	for _, ns := range namespaces {
+		ns := ns.Name
+		if err := sem.Acquire(ctx, 1); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		eg.Go(func() error {
+			defer sem.Release(1)
+			resourcesForNamespace, err := client.Namespace(ns).List(ctx, opts)
+			if err != nil {
+				return err
+			}
+			if resourcesForNamespace != nil && len(resourcesForNamespace.Items) > 0 {
+				rv, err := strconv.Atoi(resourcesForNamespace.GetResourceVersion())
+				if err != nil {
+					rv = 0
+				}
+				resourceVersions <- rv
+				for _, r := range resourcesForNamespace.Items {
+					results <- r
+				}
+			}
+			return nil
+		})
+	}
+	err := eg.Wait()
+	if isErrorAndHandleError(w, err) {
+		return
+	}
+	close(results)
+	close(resourceVersions)
+	<-doneResources
+	<-doneVersions
+
+	err = sortCollection(resourceCollection)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	returnResp(w, resources.UnstructuredContent())
-	return nil
+	resp := responseData(resource, apis.GetKindForResource(resource)+"List", strconv.Itoa(latestResourceVersion), resourceCollection)
+	w.Header().Set("Content-Type", "application/json")
+	returnResp(w, resp)
 }
 
 func sortCollection(resourceCollection []unstructured.Unstructured) error {
@@ -291,13 +326,22 @@ func gvrFromVars(vars map[string]string, apis apiresources.APIResourceWatcher) (
 	return schema.GroupVersionResource{Group: group, Version: resource.Version, Resource: resourceName}, nil
 }
 
+func convertEvent(event watch.Event) (*metav1.WatchEvent, error) {
+	internalEvent := metav1.InternalEvent(event)
+	outEvent := &metav1.WatchEvent{}
+	err := metav1.Convert_v1_InternalEvent_To_v1_WatchEvent(&internalEvent, outEvent, nil)
+	if err != nil {
+		return nil, err
+	}
+	return outEvent, nil
+}
+
 func returnResp(w http.ResponseWriter, resp interface{}) {
 	resourceJSON, err := json.Marshal(resp)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
 	w.Write(resourceJSON)
 	w.Write([]byte("\n"))
 	return
@@ -312,4 +356,16 @@ func responseData(resource schema.GroupVersionResource, kind, resourceVersion st
 		},
 		"items": items,
 	}
+}
+
+func isErrorAndHandleError(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
+	}
+	if apierrors.IsNotFound(err) {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return true
+	}
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+	return true
 }
