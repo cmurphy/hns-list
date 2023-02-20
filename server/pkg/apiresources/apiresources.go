@@ -19,7 +19,10 @@ import (
 	apiregv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 )
 
-var queueRefreshDelay = time.Duration(500)
+var (
+	queueRefreshDelay  = 500 * time.Millisecond
+	enqueueAfterPeriod = 30 * time.Second
+)
 
 // APIResourceWatcher provides access to the Kubernetes schema.
 type APIResourceWatcher interface {
@@ -33,6 +36,7 @@ type apiResourceWatcher struct {
 
 	toSync       int32
 	client       discovery.DiscoveryInterface
+	crds         apiextcontrollerv1.CustomResourceDefinitionController
 	apiResources []metav1.APIResource
 	gvrToKind    map[schema.GroupVersionResource]string
 	resourceMap  map[string]metav1.APIResource
@@ -40,15 +44,16 @@ type apiResourceWatcher struct {
 
 // WatchAPIResources creates an APIResourceWatcher object and starts watches on CRDs and APIServices,
 // which prompts it to run a discovery check to get the most up to date Kubernetes schema.
-func WatchAPIResources(ctx context.Context, discovery discovery.DiscoveryInterface, crd apiextcontrollerv1.CustomResourceDefinitionController, apiService apiregcontrollerv1.APIServiceController) APIResourceWatcher {
+func WatchAPIResources(ctx context.Context, discovery discovery.DiscoveryInterface, crds apiextcontrollerv1.CustomResourceDefinitionController, apiServices apiregcontrollerv1.APIServiceController) APIResourceWatcher {
 	a := &apiResourceWatcher{
 		client:      discovery,
+		crds:        crds,
 		gvrToKind:   make(map[schema.GroupVersionResource]string),
 		resourceMap: make(map[string]metav1.APIResource),
 	}
 
-	crd.OnChange(ctx, "hns-api", a.OnChangeCRD)
-	apiService.OnChange(ctx, "hns-api", a.OnChangeAPIService)
+	crds.OnChange(ctx, "hns-api", a.OnChangeCRD)
+	apiServices.OnChange(ctx, "hns-api", a.OnChangeAPIService)
 	return a
 }
 
@@ -94,10 +99,11 @@ func (a *apiResourceWatcher) queueRefresh() {
 	atomic.StoreInt32(&a.toSync, 1)
 
 	go func() {
-		time.Sleep(queueRefreshDelay * time.Millisecond)
+		time.Sleep(queueRefreshDelay)
 		if err := a.refreshAll(); err != nil {
-			logrus.Errorf("failed to sync schemas: %v", err)
+			logrus.Errorf("failed to sync schemas, will retry: %v", err)
 			atomic.StoreInt32(&a.toSync, 1)
+			a.crds.EnqueueAfter("", enqueueAfterPeriod)
 		}
 	}()
 }
