@@ -28,9 +28,13 @@ import (
 )
 
 const (
-	FieldSelectorKey = "fieldSelector"
-	workers          = int64(3)
-	hnsLabelSuffix   = ".tree.hnc.x-k8s.io/depth"
+	FieldSelectorKey    = "fieldSelector"
+	KubeSystemNamespace = "kube-system"
+	ExtensionConfigMap  = "extension-apiserver-authentication"
+	ClientCAKey         = "requestheader-client-ca-file"
+	AllowedCNKey        = "requestheader-allowed-names"
+	workers             = int64(3)
+	hnsLabelSuffix      = ".tree.hnc.x-k8s.io/depth"
 )
 
 var (
@@ -40,6 +44,49 @@ var (
 
 func init() {
 	metav1.AddToGroupVersion(paramScheme, metav1.SchemeGroupVersion)
+}
+
+func AuthenticateMiddleware(configMapCache corecontrollers.ConfigMapCache) mux.MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if len(r.TLS.PeerCertificates) == 0 {
+				logrus.Warnf("user is not authenticated")
+				http.Error(w, "user is not authenticated", http.StatusUnauthorized)
+				return
+			}
+			requestCN := r.TLS.PeerCertificates[0].Subject.CommonName
+			logrus.Tracef("authenticating user %s", requestCN)
+			config, err := configMapCache.Get(KubeSystemNamespace, ExtensionConfigMap)
+			if err != nil {
+				logrus.Errorf("could not authenticate API server, err: %v", err)
+				http.Error(w, fmt.Sprintf("could not authenticate API server, error: %v", err), http.StatusInternalServerError)
+				return
+			}
+			allowedCNString, ok := config.Data[AllowedCNKey]
+			if !ok {
+				http.Error(w, "could not authenticate API server, invalid extension config", http.StatusInternalServerError)
+			}
+			allowedCN := []string{}
+			if err := json.Unmarshal([]byte(allowedCNString), &allowedCN); err != nil {
+				logrus.Errorf("could not authenticate API server, err: %v", err)
+				http.Error(w, fmt.Sprintf("could not authenticate API server, error: %v", err), http.StatusInternalServerError)
+				return
+			}
+			found := false
+			for _, allowed := range allowedCN {
+				if allowed == requestCN {
+					found = true
+					break
+				}
+			}
+			if !found {
+				logrus.Warnf("could not find user %s in allowed users", requestCN)
+				http.Error(w, fmt.Sprintf("user %s not allowed", requestCN), http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func DiscoveryHandler(apis apiresources.APIResourceWatcher) http.HandlerFunc {

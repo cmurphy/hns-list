@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net/http"
 	"os"
@@ -14,8 +16,10 @@ import (
 	"github.com/rancher/wrangler/pkg/generated/controllers/apiextensions.k8s.io"
 	"github.com/rancher/wrangler/pkg/generated/controllers/apiregistration.k8s.io"
 	"github.com/rancher/wrangler/pkg/generated/controllers/core"
+	corecontrollers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -130,22 +134,50 @@ func server(ctx context.Context, c *cli.Context, apis apiresources.APIResourceWa
 		logrus.Fatal(err)
 		return
 	}
-	namespaceFactory, err := core.NewFactoryFromConfig(cfg)
+	coreFactory, err := core.NewFactoryFromConfig(cfg)
 	if err != nil {
 		logrus.Fatal(err)
 	}
-	namespaceCache := namespaceFactory.Core().V1().Namespace().Cache()
-	namespaceFactory.Start(ctx, 50)
+	namespaceCache := coreFactory.Core().V1().Namespace().Cache()
+	configMapCache := coreFactory.Core().V1().ConfigMap().Cache()
+	coreFactory.Start(ctx, 50)
 	mux := mux.NewRouter()
 	mux.HandleFunc("/apis/resources.hns.demo/v1alpha1", handlers.DiscoveryHandler(apis))
 	mux.HandleFunc("/apis/resources.hns.demo/v1alpha1/{resource}", handlers.Forwarder(dynamicClient, apis))
 	mux.HandleFunc("/apis/resources.hns.demo/v1alpha1/namespaces/{namespace}/{resource}", handlers.NamespaceHandler(apis, namespaceCache, dynamicClient))
-	http.Handle("/", mux)
+	mux.Use(handlers.AuthenticateMiddleware(configMapCache))
 
 	address := c.String("host") + ":" + c.String("port")
-	logrus.Infof("starting server on %s", address)
-	err = http.ListenAndServeTLS(address, c.String("certpath"), c.String("keypath"), nil)
+	clientCA, err := getClientCA(coreFactory.Core().V1().ConfigMap())
 	if err != nil {
 		logrus.Fatal(err)
 	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM([]byte(clientCA))
+	tlsConfig := &tls.Config{
+		ClientCAs:  caCertPool,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+	}
+	server := http.Server{
+		Addr:      address,
+		Handler:   mux,
+		TLSConfig: tlsConfig,
+	}
+	logrus.Infof("starting server on %s", address)
+	err = server.ListenAndServeTLS(c.String("certpath"), c.String("keypath"))
+	if err != nil {
+		logrus.Fatal(err)
+	}
+}
+
+func getClientCA(configMapClient corecontrollers.ConfigMapClient) (string, error) {
+	config, err := configMapClient.Get(handlers.KubeSystemNamespace, handlers.ExtensionConfigMap, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	clientCA, ok := config.Data[handlers.ClientCAKey]
+	if !ok {
+		return "", fmt.Errorf("invalid extension config")
+	}
+	return string(clientCA), nil
 }
