@@ -15,14 +15,15 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/rancher/wrangler/pkg/generated/controllers/apiextensions.k8s.io"
 	"github.com/rancher/wrangler/pkg/generated/controllers/apiregistration.k8s.io"
-	"github.com/rancher/wrangler/pkg/generated/controllers/core"
-	corecontrollers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	corecache "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -132,15 +133,17 @@ func server(ctx context.Context, c *cli.Context, apis apiresources.APIResourceWa
 	dynamicClient, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		logrus.Fatal(err)
-		return
 	}
-	coreFactory, err := core.NewFactoryFromConfig(cfg)
+	factory, err := getInformerFactory(cfg)
 	if err != nil {
 		logrus.Fatal(err)
 	}
-	namespaceCache := coreFactory.Core().V1().Namespace().Cache()
-	configMapCache := coreFactory.Core().V1().ConfigMap().Cache()
-	coreFactory.Start(ctx, 50)
+	stop := make(chan struct{})
+	defer close(stop)
+	namespaceCache, configMapCache, err := setUpInformers(factory, stop)
+	if err != nil {
+		logrus.Fatal(err)
+	}
 	mux := mux.NewRouter()
 	mux.HandleFunc("/apis/resources.hns.demo/v1alpha1", handlers.DiscoveryHandler(apis))
 	mux.HandleFunc("/apis/resources.hns.demo/v1alpha1/{resource}", handlers.Forwarder(dynamicClient, apis))
@@ -148,7 +151,7 @@ func server(ctx context.Context, c *cli.Context, apis apiresources.APIResourceWa
 	mux.Use(handlers.AuthenticateMiddleware(configMapCache))
 
 	address := c.String("host") + ":" + c.String("port")
-	clientCA, err := getClientCA(coreFactory.Core().V1().ConfigMap())
+	clientCA, err := getClientCA(configMapCache)
 	if err != nil {
 		logrus.Fatal(err)
 	}
@@ -170,8 +173,8 @@ func server(ctx context.Context, c *cli.Context, apis apiresources.APIResourceWa
 	}
 }
 
-func getClientCA(configMapClient corecontrollers.ConfigMapClient) (string, error) {
-	config, err := configMapClient.Get(handlers.KubeSystemNamespace, handlers.ExtensionConfigMap, metav1.GetOptions{})
+func getClientCA(configMapCache corecache.ConfigMapNamespaceLister) (string, error) {
+	config, err := configMapCache.Get(handlers.ExtensionConfigMap)
 	if err != nil {
 		return "", err
 	}
@@ -180,4 +183,22 @@ func getClientCA(configMapClient corecontrollers.ConfigMapClient) (string, error
 		return "", fmt.Errorf("invalid extension config")
 	}
 	return string(clientCA), nil
+}
+
+func getInformerFactory(cfg *rest.Config) (informers.SharedInformerFactory, error) {
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return informers.NewSharedInformerFactory(clientset, 0), nil
+}
+
+func setUpInformers(factory informers.SharedInformerFactory, stop chan struct{}) (corecache.NamespaceLister, corecache.ConfigMapNamespaceLister, error) {
+	namespaceInformer := factory.Core().V1().Namespaces()
+	configMapInformer := factory.Core().V1().ConfigMaps()
+	go factory.Start(stop)
+	if !cache.WaitForCacheSync(stop, namespaceInformer.Informer().HasSynced, configMapInformer.Informer().HasSynced) {
+		return nil, nil, fmt.Errorf("cached failed to sync")
+	}
+	return namespaceInformer.Lister(), configMapInformer.Lister().ConfigMaps(handlers.KubeSystemNamespace), nil
 }

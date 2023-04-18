@@ -13,7 +13,6 @@ import (
 	"github.com/cmurphy/hns-list/pkg/apiresources"
 	"github.com/cmurphy/hns-list/pkg/consts"
 	"github.com/gorilla/mux"
-	corecontrollers "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
@@ -25,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
+	corecache "k8s.io/client-go/listers/core/v1"
 )
 
 const (
@@ -46,7 +46,7 @@ func init() {
 	metav1.AddToGroupVersion(paramScheme, metav1.SchemeGroupVersion)
 }
 
-func AuthenticateMiddleware(configMapCache corecontrollers.ConfigMapCache) mux.MiddlewareFunc {
+func AuthenticateMiddleware(configMapCache corecache.ConfigMapNamespaceLister) mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if len(r.TLS.PeerCertificates) == 0 {
@@ -56,7 +56,7 @@ func AuthenticateMiddleware(configMapCache corecontrollers.ConfigMapCache) mux.M
 			}
 			requestCN := r.TLS.PeerCertificates[0].Subject.CommonName
 			logrus.Tracef("authenticating user %s", requestCN)
-			config, err := configMapCache.Get(KubeSystemNamespace, ExtensionConfigMap)
+			config, err := configMapCache.Get(ExtensionConfigMap)
 			if err != nil {
 				logrus.Errorf("could not authenticate API server, err: %v", err)
 				http.Error(w, fmt.Sprintf("could not authenticate API server, error: %v", err), http.StatusInternalServerError)
@@ -138,7 +138,7 @@ func Forwarder(dynamicClient dynamic.Interface, apis apiresources.APIResourceWat
 	}
 }
 
-func NamespaceHandler(apis apiresources.APIResourceWatcher, namespaceCache corecontrollers.NamespaceCache, dynamicClient dynamic.Interface) http.HandlerFunc {
+func NamespaceHandler(apis apiresources.APIResourceWatcher, namespaceCache corecache.NamespaceLister, dynamicClient dynamic.Interface) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		logrus.Tracef("handling request %s\n", r.URL.Path)
 
