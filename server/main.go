@@ -9,22 +9,24 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/cmurphy/hns-list/pkg/apiresources"
 	"github.com/cmurphy/hns-list/pkg/handlers"
 	"github.com/gorilla/mux"
-	"github.com/rancher/wrangler/pkg/generated/controllers/apiextensions.k8s.io"
-	"github.com/rancher/wrangler/pkg/generated/controllers/apiregistration.k8s.io"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corecache "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	apiregv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 )
 
 func main() {
@@ -43,8 +45,7 @@ func main() {
 		if err != nil {
 			logrus.Fatalf("could not start watcher: %v", err)
 		}
-		w := watcher(ctx, cfg)
-		server(ctx, c, w, cfg)
+		server(ctx, c, cfg)
 		return nil
 	}
 	app.Flags = []cli.Flag{
@@ -108,39 +109,23 @@ func getConfig(kubeconfig string) (*rest.Config, error) {
 	return cfg, nil
 }
 
-func watcher(ctx context.Context, cfg *rest.Config) apiresources.APIResourceWatcher {
+func server(ctx context.Context, c *cli.Context, cfg *rest.Config) {
 	discovery, err := discovery.NewDiscoveryClientForConfig(cfg)
 	if err != nil {
 		logrus.Fatalf("could not start watcher: %v", err)
 	}
-	crdFactory, err := apiextensions.NewFactoryFromConfig(cfg)
-	if err != nil {
-		logrus.Fatalf("could not start watcher: %v", err)
-	}
-	crd := crdFactory.Apiextensions().V1().CustomResourceDefinition()
-	apiFactory, err := apiregistration.NewFactoryFromConfig(cfg)
-	if err != nil {
-		logrus.Fatalf("could not start watcher: %v", err)
-	}
-	apiService := apiFactory.Apiregistration().V1().APIService()
-	apiResourceWatcher := apiresources.WatchAPIResources(ctx, discovery, crd, apiService)
-	crdFactory.Start(ctx, 50)
-	apiFactory.Start(ctx, 50)
-	return apiResourceWatcher
-}
-
-func server(ctx context.Context, c *cli.Context, apis apiresources.APIResourceWatcher, cfg *rest.Config) {
 	dynamicClient, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		logrus.Fatal(err)
 	}
+	dynamicFactory := getDynamicInformerFactory(dynamicClient)
+	crdInformer, apiServiceInformer := setUpAPIInformers(dynamicFactory, ctx.Done())
+	apis := apiresources.WatchAPIResources(ctx, discovery, crdInformer, apiServiceInformer)
 	factory, err := getInformerFactory(cfg)
 	if err != nil {
 		logrus.Fatal(err)
 	}
-	stop := make(chan struct{})
-	defer close(stop)
-	namespaceCache, configMapCache, err := setUpInformers(factory, stop)
+	namespaceCache, configMapCache, err := setUpInformers(factory, ctx.Done())
 	if err != nil {
 		logrus.Fatal(err)
 	}
@@ -193,7 +178,11 @@ func getInformerFactory(cfg *rest.Config) (informers.SharedInformerFactory, erro
 	return informers.NewSharedInformerFactory(clientset, 0), nil
 }
 
-func setUpInformers(factory informers.SharedInformerFactory, stop chan struct{}) (corecache.NamespaceLister, corecache.ConfigMapNamespaceLister, error) {
+func getDynamicInformerFactory(dynamicClient dynamic.Interface) dynamicinformer.DynamicSharedInformerFactory {
+	return dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, time.Minute)
+}
+
+func setUpInformers(factory informers.SharedInformerFactory, stop <-chan struct{}) (corecache.NamespaceLister, corecache.ConfigMapNamespaceLister, error) {
 	namespaceInformer := factory.Core().V1().Namespaces()
 	configMapInformer := factory.Core().V1().ConfigMaps()
 	go factory.Start(stop)
@@ -201,4 +190,13 @@ func setUpInformers(factory informers.SharedInformerFactory, stop chan struct{})
 		return nil, nil, fmt.Errorf("cached failed to sync")
 	}
 	return namespaceInformer.Lister(), configMapInformer.Lister().ConfigMaps(handlers.KubeSystemNamespace), nil
+}
+
+func setUpAPIInformers(factory dynamicinformer.DynamicSharedInformerFactory, stop <-chan struct{}) (cache.SharedIndexInformer, cache.SharedIndexInformer) {
+	crdGVR := apiextv1.SchemeGroupVersion.WithResource("customresourcedefinitions")
+	crdInformer := factory.ForResource(crdGVR).Informer()
+	apiServiceGVR := apiregv1.SchemeGroupVersion.WithResource("apiservices")
+	apiServiceInformer := factory.ForResource(apiServiceGVR).Informer()
+	go factory.Start(stop)
+	return crdInformer, apiServiceInformer
 }

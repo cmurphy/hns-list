@@ -8,15 +8,14 @@ import (
 	"time"
 
 	"github.com/cmurphy/hns-list/pkg/consts"
-	apiextcontrollerv1 "github.com/rancher/wrangler/pkg/generated/controllers/apiextensions.k8s.io/v1"
-	apiregcontrollerv1 "github.com/rancher/wrangler/pkg/generated/controllers/apiregistration.k8s.io/v1"
 	"github.com/sirupsen/logrus"
-	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	apidiscovery "k8s.io/apiserver/pkg/endpoints/discovery"
 	"k8s.io/client-go/discovery"
-	apiregv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
 var (
@@ -36,37 +35,73 @@ type apiResourceWatcher struct {
 
 	toSync       int32
 	client       discovery.DiscoveryInterface
-	crds         apiextcontrollerv1.CustomResourceDefinitionController
 	apiResources []metav1.APIResource
 	gvrToKind    map[schema.GroupVersionResource]string
 	resourceMap  map[string]metav1.APIResource
+	retryQueue   workqueue.RateLimitingInterface
 }
 
 // WatchAPIResources creates an APIResourceWatcher object and starts watches on CRDs and APIServices,
 // which prompts it to run a discovery check to get the most up to date Kubernetes schema.
-func WatchAPIResources(ctx context.Context, discovery discovery.DiscoveryInterface, crds apiextcontrollerv1.CustomResourceDefinitionController, apiServices apiregcontrollerv1.APIServiceController) APIResourceWatcher {
+func WatchAPIResources(ctx context.Context, discovery discovery.DiscoveryInterface, crds cache.SharedIndexInformer, apiServices cache.SharedIndexInformer) APIResourceWatcher {
 	a := &apiResourceWatcher{
 		client:      discovery,
-		crds:        crds,
 		gvrToKind:   make(map[schema.GroupVersionResource]string),
 		resourceMap: make(map[string]metav1.APIResource),
+		retryQueue:  workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
 	}
 
-	crds.OnChange(ctx, "hns-api", a.OnChangeCRD)
-	apiServices.OnChange(ctx, "hns-api", a.OnChangeAPIService)
+	crds.AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    a.onAdd,
+			UpdateFunc: a.onUpdate,
+			DeleteFunc: a.onDelete,
+		},
+	)
+
+	apiServices.AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    a.onAdd,
+			UpdateFunc: a.onUpdate,
+			DeleteFunc: a.onDelete,
+		},
+	)
+
+	go a.handleRetries(ctx)
 	return a
 }
 
-// OnChangeCRD queues the refresh when a CRD event occurs.
-func (a *apiResourceWatcher) OnChangeCRD(_ string, crd *apiextv1.CustomResourceDefinition) (*apiextv1.CustomResourceDefinition, error) {
+func (a *apiResourceWatcher) onAdd(_ interface{}) {
 	a.queueRefresh()
-	return crd, nil
 }
 
-// OnChangeAPIService queues the refresh when an APIService event occurs.
-func (a *apiResourceWatcher) OnChangeAPIService(_ string, apiService *apiregv1.APIService) (*apiregv1.APIService, error) {
+func (a *apiResourceWatcher) onUpdate(_, _ interface{}) {
 	a.queueRefresh()
-	return apiService, nil
+}
+
+func (a *apiResourceWatcher) onDelete(_ interface{}) {
+	a.queueRefresh()
+}
+
+func (a *apiResourceWatcher) handleRetries(ctx context.Context) {
+	defer a.retryQueue.ShutDown()
+	wait.Until(a.runRetrier, time.Second, ctx.Done())
+}
+
+func (a *apiResourceWatcher) runRetrier() {
+	for a.next() {
+	}
+}
+
+func (a *apiResourceWatcher) next() bool {
+	key, stop := a.retryQueue.Get()
+	if stop {
+		return false
+	}
+	defer a.retryQueue.Forget(key)
+	defer a.retryQueue.Done(key)
+	a.queueRefresh()
+	return true
 }
 
 // GetKindForResource returns the resource Kind given its GVR.
@@ -103,7 +138,7 @@ func (a *apiResourceWatcher) queueRefresh() {
 		if err := a.refreshAll(); err != nil {
 			logrus.Errorf("failed to sync schemas, will retry: %v", err)
 			atomic.StoreInt32(&a.toSync, 1)
-			a.crds.EnqueueAfter("", enqueueAfterPeriod)
+			a.retryQueue.AddAfter("", enqueueAfterPeriod)
 		}
 	}()
 }
