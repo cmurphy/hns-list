@@ -114,11 +114,11 @@ func server(ctx context.Context, c *cli.Context, cfg *rest.Config) {
 	if err != nil {
 		logrus.Fatalf("could not start watcher: %v", err)
 	}
-	dynamicClient, err := dynamic.NewForConfig(cfg)
+	clientGetter := handlers.ClientGetter(cfg)
+	dynamicFactory, err := getDynamicInformerFactory(cfg)
 	if err != nil {
 		logrus.Fatal(err)
 	}
-	dynamicFactory := getDynamicInformerFactory(dynamicClient)
 	crdInformer, apiServiceInformer := setUpAPIInformers(dynamicFactory, ctx.Done())
 	apis := apiresources.WatchAPIResources(ctx, discovery, crdInformer, apiServiceInformer)
 	factory, err := getInformerFactory(cfg)
@@ -131,8 +131,8 @@ func server(ctx context.Context, c *cli.Context, cfg *rest.Config) {
 	}
 	mux := mux.NewRouter()
 	mux.HandleFunc("/apis/resources.hns.demo/v1alpha1", handlers.DiscoveryHandler(apis))
-	mux.HandleFunc("/apis/resources.hns.demo/v1alpha1/{resource}", handlers.Forwarder(dynamicClient, apis))
-	mux.HandleFunc("/apis/resources.hns.demo/v1alpha1/namespaces/{namespace}/{resource}", handlers.NamespaceHandler(apis, namespaceCache, dynamicClient))
+	mux.HandleFunc("/apis/resources.hns.demo/v1alpha1/{resource}", handlers.Forwarder(clientGetter, apis))
+	mux.HandleFunc("/apis/resources.hns.demo/v1alpha1/namespaces/{namespace}/{resource}", handlers.NamespaceHandler(clientGetter, apis, namespaceCache))
 	mux.Use(handlers.AuthenticateMiddleware(configMapCache))
 
 	address := c.String("host") + ":" + c.String("port")
@@ -178,8 +178,12 @@ func getInformerFactory(cfg *rest.Config) (informers.SharedInformerFactory, erro
 	return informers.NewSharedInformerFactory(clientset, 0), nil
 }
 
-func getDynamicInformerFactory(dynamicClient dynamic.Interface) dynamicinformer.DynamicSharedInformerFactory {
-	return dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, time.Minute)
+func getDynamicInformerFactory(cfg *rest.Config) (dynamicinformer.DynamicSharedInformerFactory, error) {
+	dynamicClient, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, time.Minute), nil
 }
 
 func setUpInformers(factory informers.SharedInformerFactory, stop <-chan struct{}) (corecache.NamespaceLister, corecache.ConfigMapNamespaceLister, error) {

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/cmurphy/hns-list/pkg/apiresources"
 	"github.com/cmurphy/hns-list/pkg/consts"
@@ -108,7 +109,7 @@ func DiscoveryHandler(apis apiresources.APIResourceWatcher) http.HandlerFunc {
 	}
 }
 
-func Forwarder(dynamicClient dynamic.Interface, apis apiresources.APIResourceWatcher) http.HandlerFunc {
+func Forwarder(clientGetter clientGetter, apis apiresources.APIResourceWatcher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		logrus.Tracef("handling request %s\n", r.URL.Path)
 		vars := mux.Vars(r)
@@ -117,7 +118,11 @@ func Forwarder(dynamicClient dynamic.Interface, apis apiresources.APIResourceWat
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		resourceClient := dynamicClient.Resource(resource)
+		resourceClient, err := clientGetter(r, resource)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		opts := metav1.ListOptions{}
 		paramCodec.DecodeParameters(r.URL.Query(), metav1.SchemeGroupVersion, &opts)
 
@@ -138,7 +143,7 @@ func Forwarder(dynamicClient dynamic.Interface, apis apiresources.APIResourceWat
 	}
 }
 
-func NamespaceHandler(apis apiresources.APIResourceWatcher, namespaceCache corecache.NamespaceLister, dynamicClient dynamic.Interface) http.HandlerFunc {
+func NamespaceHandler(clientGetter clientGetter, apis apiresources.APIResourceWatcher, namespaceCache corecache.NamespaceLister) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		logrus.Tracef("handling request %s\n", r.URL.Path)
 
@@ -149,7 +154,11 @@ func NamespaceHandler(apis apiresources.APIResourceWatcher, namespaceCache corec
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		resourceClient := dynamicClient.Resource(resource)
+		resourceClient, err := clientGetter(r, resource)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
 		opts := metav1.ListOptions{}
 		paramCodec.DecodeParameters(r.URL.Query(), metav1.SchemeGroupVersion, &opts)
@@ -265,18 +274,29 @@ func watchHandler(w http.ResponseWriter, r *http.Request, client dynamic.Namespa
 }
 
 func listHandler(w http.ResponseWriter, r *http.Request, resource schema.GroupVersionResource, client dynamic.NamespaceableResourceInterface, namespaces []*corev1.Namespace, opts metav1.ListOptions, apis apiresources.APIResourceWatcher) {
-	results := make(chan unstructured.Unstructured)
-	resourceCollection := make([]unstructured.Unstructured, 0)
+	itemsChan := make(chan unstructured.Unstructured)
+	rowsChan := make(chan interface{})
+	itemsList := make([]unstructured.Unstructured, 0)
+	rowList := make([]interface{}, 0)
 	latestResourceVersion := 0
 	resourceVersions := make(chan int)
-	doneResources := make(chan bool)
-	doneVersions := make(chan bool)
+	var columns []interface{}
+
+	wg := sync.WaitGroup{}
+	wg.Add(3)
 
 	go func() {
-		for r := range results {
-			resourceCollection = append(resourceCollection, r)
+		for i := range itemsChan {
+			itemsList = append(itemsList, i)
 		}
-		doneResources <- true
+		wg.Done()
+	}()
+
+	go func() {
+		for r := range rowsChan {
+			rowList = append(rowList, r)
+		}
+		wg.Done()
 	}()
 
 	go func() {
@@ -285,7 +305,7 @@ func listHandler(w http.ResponseWriter, r *http.Request, resource schema.GroupVe
 				latestResourceVersion = r
 			}
 		}
-		doneVersions <- true
+		wg.Done()
 	}()
 
 	eg, ctx := errgroup.WithContext(r.Context())
@@ -302,15 +322,25 @@ func listHandler(w http.ResponseWriter, r *http.Request, resource schema.GroupVe
 			if err != nil {
 				return err
 			}
-			if resourcesForNamespace != nil && len(resourcesForNamespace.Items) > 0 {
+			if resourcesForNamespace == nil {
+				return nil
+			}
+			rows, _ := resourcesForNamespace.Object["rows"].([]interface{})
+			columns, _ = resourcesForNamespace.Object["columnDefinitions"].([]interface{})
+			if len(resourcesForNamespace.Items) > 0 || (len(rows) > 0) {
+				// resourceVersion will be different for every request, and in the end we want the latest one,
+				// but we won't know which one is the latest until the channel is done processing.
 				rv, err := strconv.Atoi(resourcesForNamespace.GetResourceVersion())
 				if err != nil {
 					rv = 0
 				}
 				resourceVersions <- rv
-				for _, r := range resourcesForNamespace.Items {
-					results <- r
-				}
+			}
+			for _, r := range rows {
+				rowsChan <- r
+			}
+			for _, r := range resourcesForNamespace.Items {
+				itemsChan <- r
 			}
 			return nil
 		})
@@ -319,44 +349,61 @@ func listHandler(w http.ResponseWriter, r *http.Request, resource schema.GroupVe
 	if isErrorAndHandleError(w, err) {
 		return
 	}
-	close(results)
+	close(itemsChan)
+	close(rowsChan)
 	close(resourceVersions)
-	<-doneResources
-	<-doneVersions
+	wg.Wait()
 
-	err = sortCollection(resourceCollection)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	sortItems(itemsList)
+	sortRows(rowList)
+
+	resourceVersion := strconv.Itoa(latestResourceVersion)
+	if resourceVersion == "0" { // this may happen if the namespace slice was empty, but we still need to return a valid resource version.
+		resourceVersion, err = emptyResourceVersion(r.Context(), resource, client)
+		if isErrorAndHandleError(w, err) {
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if len(rowList) > 0 {
+		resp := responseTable(resourceVersion, columns, rowList)
+		returnResp(w, resp)
 		return
 	}
-
-	resp := responseData(resource, apis.GetKindForResource(resource)+"List", strconv.Itoa(latestResourceVersion), resourceCollection)
-	w.Header().Set("Content-Type", "application/json")
+	resp := responseData(resource, apis.GetKindForResource(resource)+"List", resourceVersion, itemsList)
 	returnResp(w, resp)
 }
 
-func sortCollection(resourceCollection []unstructured.Unstructured) error {
-	var err error
+func sortItems(resourceCollection []unstructured.Unstructured) {
 	sort.Slice(resourceCollection, func(i, j int) bool {
-		metaI, ok := resourceCollection[i].Object["metadata"].(map[string]interface{})
-		if !ok {
-			err = fmt.Errorf("could not sort invalid resource")
-			return false
-		}
-		metaJ, ok := resourceCollection[j].Object["metadata"].(map[string]interface{})
-		if !ok {
-			err = fmt.Errorf("could not sort invalid resource")
-			return false
-		}
-		if metaI["namespace"].(string) < metaJ["namespace"].(string) {
+		objI := resourceCollection[i]
+		objJ := resourceCollection[j]
+		if objI.GetNamespace() < objJ.GetNamespace() {
 			return true
 		}
-		if metaI["namespace"].(string) > metaJ["namespace"].(string) {
+		if objI.GetNamespace() > objJ.GetNamespace() {
 			return false
 		}
-		return metaI["name"].(string) < metaJ["name"].(string)
+		return objI.GetName() < objJ.GetName()
 	})
-	return err
+}
+
+func sortRows(rows []interface{}) {
+	sort.Slice(rows, func(i, j int) bool {
+		rowI, _ := rows[i].(map[string]interface{})
+		objI, _ := rowI["object"].(map[string]interface{})
+		unstI := unstructured.Unstructured{Object: objI}
+		rowJ, _ := rows[j].(map[string]interface{})
+		objJ, _ := rowJ["object"].(map[string]interface{})
+		unstJ := unstructured.Unstructured{Object: objJ}
+		if unstI.GetNamespace() < unstJ.GetNamespace() {
+			return true
+		}
+		if unstI.GetNamespace() > unstJ.GetNamespace() {
+			return false
+		}
+		return unstI.GetName() < unstJ.GetName()
+	})
 }
 
 func gvrFromVars(vars map[string]string, apis apiresources.APIResourceWatcher) (schema.GroupVersionResource, error) {
@@ -394,6 +441,15 @@ func returnResp(w http.ResponseWriter, resp interface{}) {
 	return
 }
 
+func emptyResourceVersion(ctx context.Context, gvr schema.GroupVersionResource, resourceClient dynamic.ResourceInterface) (string, error) {
+	// get the list but ignore the resources, this is needed to get the list resource version
+	resourceList, err := resourceClient.List(ctx, metav1.ListOptions{Limit: 1})
+	if err != nil {
+		return "", fmt.Errorf("failed to get resource version for resource %s: %w", gvr.Resource, err)
+	}
+	return resourceList.GetResourceVersion(), nil
+}
+
 func responseData(resource schema.GroupVersionResource, kind, resourceVersion string, items []unstructured.Unstructured) map[string]interface{} {
 	return map[string]interface{}{
 		"apiVersion": resource.GroupVersion().String(),
@@ -403,6 +459,18 @@ func responseData(resource schema.GroupVersionResource, kind, resourceVersion st
 		},
 		"items": items,
 	}
+}
+
+func responseTable(resourceVersion string, columnDefinitions interface{}, rows interface{}) *unstructured.UnstructuredList {
+	list := &unstructured.UnstructuredList{}
+	list.SetUnstructuredContent(map[string]interface{}{
+		"columnDefinitions": columnDefinitions,
+		"rows":              rows,
+	})
+	list.SetAPIVersion("meta.k8s.io/v1")
+	list.SetKind("Table")
+	list.SetResourceVersion(resourceVersion)
+	return list
 }
 
 func isErrorAndHandleError(w http.ResponseWriter, err error) bool {
