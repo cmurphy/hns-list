@@ -35,6 +35,9 @@ func init() {
 				return err
 			}
 
+			// TODO: support --output flag
+			setTableMediaType(config)
+
 			mapper, err = kubecfgFlags.ToRESTMapper()
 			if err != nil {
 				return err
